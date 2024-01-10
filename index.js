@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import fs from 'fs';
 import { pick } from "lodash-es";
 import * as marked from "marked";
 import envCi from "env-ci";
@@ -16,9 +17,10 @@ import { extractErrors, makeTag } from "./lib/utils.js";
 import getGitAuthUrl from "./lib/get-git-auth-url.js";
 import getBranches from "./lib/branches/index.js";
 import getLogger from "./lib/get-logger.js";
-import { addNote, getGitHead, getTagHead, isBranchUpToDate, push, pushNotes, tag, verifyAuth } from "./lib/git.js";
+import { addNote, getGitHead, getTagHead, isBranchUpToDate, push, pushNotes, tag, verifyAuth, getGitDirectory } from "./lib/git.js";
 import getError from "./lib/get-error.js";
 import { COMMIT_EMAIL, COMMIT_NAME } from "./lib/definitions/constants.js";
+import {getWorkspaceDirectory, filterCommitsByWorkspace} from './lib/npm.js'
 
 const require = createRequire(import.meta.url);
 const pkg = require("./package.json");
@@ -39,7 +41,6 @@ async function run(context, plugins) {
   const { cwd, env, options, logger, envCi } = context;
   const { isCi, branch, prBranch, isPr } = envCi;
   const ciBranch = isPr ? prBranch : branch;
-
   if (!isCi && !options.dryRun && !options.noCi) {
     logger.warn("This run was not triggered in a known CI environment, running in dry-run mode.");
     options.dryRun = true;
@@ -63,11 +64,9 @@ async function run(context, plugins) {
 
   // Verify config
   await verify(context);
-
   options.repositoryUrl = await getGitAuthUrl({ ...context, branch: { name: ciBranch } });
   context.branches = await getBranches(options.repositoryUrl, ciBranch, context);
   context.branch = context.branches.find(({ name }) => name === ciBranch);
-
   if (!context.branch) {
     logger.log(
       `This test run was triggered on the branch ${ciBranch}, while semantic-release is configured to only publish from ${context.branches
@@ -82,12 +81,13 @@ async function run(context, plugins) {
       options.dryRun ? " in dry-run mode" : ""
     }`
   );
-
   try {
     try {
       await verifyAuth(options.repositoryUrl, context.branch.name, { cwd, env });
     } catch (error) {
-      if (!(await isBranchUpToDate(options.repositoryUrl, context.branch.name, { cwd, env }))) {
+      const isUpToDate = await isBranchUpToDate(options.repositoryUrl, context.branch.name, { cwd, env });
+      
+      if (!isUpToDate ) {
         logger.log(
           `The local branch ${context.branch.name} is behind the remote one, therefore a new version won't be published.`
         );
@@ -102,8 +102,10 @@ async function run(context, plugins) {
   }
 
   logger.success(`Allowed to push to the Git repository`);
+  await plugins.verifyConditions(context); 
 
-  await plugins.verifyConditions(context);
+  context.workspaceDirectory = getWorkspaceDirectory(context);
+  context.gitDirectory = await getGitDirectory();
 
   const errors = [];
   context.releases = [];
@@ -117,7 +119,12 @@ async function run(context, plugins) {
     if (context.branch.mergeRange && !semver.satisfies(nextRelease.version, context.branch.mergeRange)) {
       errors.push(getError("EINVALIDMAINTENANCEMERGE", { ...context, nextRelease }));
     } else {
-      const commits = await getCommits({ ...context, lastRelease, nextRelease });
+      let commits = await getCommits({ ...context, lastRelease, nextRelease });
+      if (context.workspaceDirectory){
+        logger.log(`Applying workspace filter`);
+        commits = filterCommitsByWorkspace(context.workspaceDirectory, context.gitDirectory, commits)
+        logger.log(`Found ${commits.length} commits since last release for workspace ${context.workspaceDirectory}`);
+      }
       nextRelease.notes = await plugins.generateNotes({ ...context, commits, lastRelease, nextRelease });
 
       if (options.dryRun) {
@@ -167,6 +174,12 @@ async function run(context, plugins) {
   }
 
   context.commits = await getCommits(context);
+  
+  if (context.workspaceDirectory){
+    logger.log(`Applying workspace filter`);
+    context.commits = filterCommitsByWorkspace(context.workspaceDirectory, context.gitDirectory, context.commits)
+    logger.log(`After applying workspace filter, found ${context.commits.length} commits since last release for workspace ${context.workspaceDirectory}`);
+  }
 
   const nextRelease = {
     type: await plugins.analyzeCommits(context),
